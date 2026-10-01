@@ -1,0 +1,6 @@
+*
+!*/
+!*.py
+!.gitignore
+/venv/
+/.venv/
