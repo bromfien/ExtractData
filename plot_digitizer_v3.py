@@ -6,23 +6,23 @@ calibrates linear axes with OCR, and writes CSV. Supports one image, multiple im
 
 Linux setup (Debian/Ubuntu):
   sudo apt install tesseract-ocr python3-pip
-  pip install opencv-python numpy scipy pytesseract
+  pip install opencv-python numpy scipy pytesseract matplotlib
 
 Examples:
-  python3 plot_digitizer_v2.py image.png --overlay --sigma 0.5
-  python3 plot_digitizer_v2.py image.png --debug
-  python3 plot_digitizer_v2.py ./plots --debug
-  python3 plot_digitizer_v2.py 'plots/*.png' -o ./csv
+  python3 plot_digitizer_v3_3.py image.png --overlay --plot --sigma 0.5
+  python3 plot_digitizer_v3_3.py image.png --debug
+  python3 plot_digitizer_v3_3.py ./plots --debug
+  python3 plot_digitizer_v3_3.py 'plots/*.png' -o ./csv
 """
 from __future__ import annotations
 import argparse, csv, glob, re, sys
 from dataclasses import dataclass
 from pathlib import Path
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import pytesseract
 from scipy.ndimage import gaussian_filter1d
-import matplotlib.pyplot as plt
 
 EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
 
@@ -45,7 +45,6 @@ class Calibration:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-# Parse command-line options.
 
 def args():
     p = argparse.ArgumentParser(description='Extract continuous plot data at pixel-step resolution.')
@@ -59,14 +58,13 @@ def args():
     p.add_argument('--trace-color', choices=['auto', 'blue'], default='auto')
     p.add_argument('--tesseract', help='Optional full path to tesseract executable')
     p.add_argument('--plot', action='store_true',
-               help='Generate and save a standalone PNG plot of the extracted data')
+                   help='Generate and save a standalone SVG vector plot of the extracted data')
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
-# Resolve image inputs from files, directories, and glob patterns.
 
 def files_from(items):
     out = []
@@ -85,7 +83,6 @@ def files_from(items):
 # ---------------------------------------------------------------------------
 # Plot rectangle detection
 # ---------------------------------------------------------------------------
-# Find the plot rectangle in an image.
 
 def plot_rect(im):
     hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
@@ -93,7 +90,6 @@ def plot_rect(im):
     row_ok = light.mean(axis=1) > .55
     col_ok = light.mean(axis=0) > .55
 
-    # Return the bounds of the longest contiguous true run.
     def longest(mask):
         d = np.diff(np.r_[False, mask, False].astype(np.int8))
         starts = list(np.where(d == 1)[0])
@@ -119,9 +115,8 @@ def plot_rect(im):
 
 
 # ---------------------------------------------------------------------------
-# OCR helpers
+# OCR helpers & Token extraction
 # ---------------------------------------------------------------------------
-# Parse OCR text as a number, correcting common character confusions.
 
 def num(s):
     s = s.strip().replace('−', '-').replace(',', '.').replace('O', '0').replace('o', '0')
@@ -137,11 +132,6 @@ def num(s):
     except ValueError:
         return None
 
-
-# ---------------------------------------------------------------------------
-# OCR token extraction
-# ---------------------------------------------------------------------------
-# Extract and deduplicate numeric OCR tokens from an image.
 
 def ocr_tokens(im):
     gray  = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
@@ -180,7 +170,6 @@ def ocr_tokens(im):
 # ---------------------------------------------------------------------------
 # Best outer pair
 # ---------------------------------------------------------------------------
-# Fit an axis calibration from the outermost usable OCR labels.
 
 def best_outer_pair(tokens, axis, rect):
     x0, y0, x1, y1 = rect
@@ -264,7 +253,6 @@ def best_outer_pair(tokens, axis, rect):
 # ---------------------------------------------------------------------------
 # Trace mask
 # ---------------------------------------------------------------------------
-# Create a mask of blue trace pixels inside the plot.
 
 def trace_mask(im, rect):
     x0, y0, x1, y1 = rect
@@ -296,7 +284,6 @@ def trace_mask(im, rect):
 # ---------------------------------------------------------------------------
 # Gap interpolation
 # ---------------------------------------------------------------------------
-# Interpolate short gaps in a one-dimensional signal.
 
 def interp(a, max_gap=10):
     a   = a.astype(float).copy()
@@ -314,9 +301,8 @@ def interp(a, max_gap=10):
 
 
 # ---------------------------------------------------------------------------
-# Full Trace Extraction (Smallest Step / Pixel-Column Resolution)
+# Full Trace Extraction
 # ---------------------------------------------------------------------------
-# Extract calibrated trace coordinates for every single pixel column across the plot.
 
 def extract_trace_points(mask, rect, xc, yc, sigma=0.0):
     x0, y0, _, _ = rect
@@ -336,7 +322,6 @@ def extract_trace_points(mask, rect, xc, yc, sigma=0.0):
     if np.isfinite(top).sum() < 10:
         raise RuntimeError('too few trace pixels detected')
 
-    # Fill remaining gaps across full plot span
     def fill(a):
         ok = np.isfinite(a)
         return np.interp(np.arange(len(a)), np.flatnonzero(ok), a[ok])
@@ -344,7 +329,6 @@ def extract_trace_points(mask, rect, xc, yc, sigma=0.0):
     top_filled    = fill(top)
     bottom_filled = fill(bottom)
 
-    # Use trace centerline in pixel coordinates
     mid_y_px = (top_filled + bottom_filled) / 2.0
 
     if sigma > 0:
@@ -367,9 +351,8 @@ def extract_trace_points(mask, rect, xc, yc, sigma=0.0):
 
 
 # ---------------------------------------------------------------------------
-# Overlay rendering
+# Overlay rendering & Plot saving
 # ---------------------------------------------------------------------------
-# Render digitized continuous curve and axis labels over the source image.
 
 def draw_overlay(im, rows, rect, xc, yc):
     out = im.copy()
@@ -378,7 +361,6 @@ def draw_overlay(im, rows, rect, xc, yc):
 
     thick = max(1, w // 800)
 
-    # Draw continuous digitized curve
     pts = np.array([[r['pixel_x'], r['pixel_y']] for r in rows], dtype=np.int32)
     pts = pts.reshape((-1, 1, 2))
     cv2.polylines(out, [pts], isClosed=False, color=(0, 0, 255), thickness=thick + 1)
@@ -411,10 +393,25 @@ def draw_overlay(im, rows, rect, xc, yc):
     return out
 
 
+def save_data_plot(rows, plot_path, title_name):
+    x = [r['X'] for r in rows]
+    y = [r['Y'] for r in rows]
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(x, y, color='#1f77b4', linewidth=0.75, label='Extracted Trace')
+    plt.title(f'Extracted Data: {title_name}', fontsize=12)
+    plt.xlabel('X Axis')
+    plt.ylabel('Y Axis')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(plot_path.with_suffix('.svg'), format='svg')
+    plt.close()
+
+
 # ---------------------------------------------------------------------------
 # Per-image processing
 # ---------------------------------------------------------------------------
-# Digitize one plot image and write its CSV and optional diagnostics.
 
 def process(path, outdir, debug, opts):
     im = cv2.imread(str(path))
@@ -448,7 +445,7 @@ def process(path, outdir, debug, opts):
         cv2.imwrite(str(overlay_path), overlay)
 
     if opts.plot:
-        plot_path = dest / (path.stem + '_plot.png')
+        plot_path = dest / (path.stem + '_plot.svg')
         save_data_plot(rows, plot_path, path.name)
 
     if debug:
@@ -533,26 +530,7 @@ def draw_ocr_preview(im, toks, rect, x_cand, y_cand):
     cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 255), 2)
     return out
 
-# ---------------------------------------------------------------------------
-# Save data plot
-# ---------------------------------------------------------------------------
-def save_data_plot(rows, plot_path, title_name):
-    x = [r['X'] for r in rows]
-    y = [r['Y'] for r in rows]
 
-    plt.figure(figsize=(9, 5))
-    plt.plot(x, y, color='#1f77b4', linewidth=1.5, label='Extracted Trace')
-    plt.title(f'Extracted Data: {title_name}', fontsize=12)
-    plt.xlabel('X Axis')
-    plt.ylabel('Y Axis')
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend(loc='best')
-    plt.tight_layout()
-    
-    # Matplotlib automatically handles vector rendering when saving to .svg
-    plt.savefig(plot_path.with_suffix('.svg'), format='svg')
-    plt.close()
-    
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
