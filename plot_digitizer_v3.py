@@ -10,9 +10,13 @@ Linux setup (Debian/Ubuntu):
 
 Examples:
   python3 plot_digitizer_v3_3.py image.png --overlay --plot --sigma 0.5
+  python3 plot_digitizer_v3_3.py spectrum.png --domain frequency --overlay --debug
   python3 plot_digitizer_v3_3.py image.png --debug
   python3 plot_digitizer_v3_3.py ./plots --debug
   python3 plot_digitizer_v3_3.py 'plots/*.png' -o ./csv
+
+  python plot_digitizer_v3.py "GB Vibration Data - 2026-10-20/Screenshots" --domain frequency --output "GB Vibration Data - 2026-10-20/OutputData"
+
 """
 from __future__ import annotations
 import argparse, csv, glob, re, sys
@@ -55,6 +59,8 @@ def args():
                    help='Write overlay PNG with continuous trace curve plotted over the original image')
     p.add_argument('--sigma', type=float, default=0.0,
                    help='Gaussian smoothing sigma applied to pixel trace Y values (default: 0.0)')
+    p.add_argument('--domain', choices=['time', 'frequency'], default='time',
+                   help='X-axis domain: time (default) or frequency; calibrated from OCR tick labels')
     p.add_argument('--trace-color', choices=['auto', 'blue'], default='auto')
     p.add_argument('--tesseract', help='Optional full path to tesseract executable')
     p.add_argument('--plot', action='store_true',
@@ -133,7 +139,7 @@ def num(s):
         return None
 
 
-def ocr_tokens(im):
+def ocr_tokens(im, rect=None):
     gray  = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
     scale = 3
     big   = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -157,6 +163,143 @@ def ocr_tokens(im):
                 d['height'][i] / scale,
                 t, conf,
             ))
+    if rect is not None:
+        x0, y0, x1, y1 = rect
+        crop = gray[max(0, y0 - 5):min(gray.shape[0], y1 + 10), :min(gray.shape[1], x0 + 10)]
+        crop_scale = 6
+        crop_big = cv2.resize(
+            crop, None, fx=crop_scale, fy=crop_scale, interpolation=cv2.INTER_CUBIC
+        )
+        d = pytesseract.image_to_data(crop_big, config='--psm 6 -c tessedit_char_whitelist=0123456789.-+',
+                                      output_type=pytesseract.Output.DICT)
+        for i, text in enumerate(d['text']):
+            value = num(text)
+            try:
+                conf = float(d['conf'][i])
+            except ValueError:
+                conf = -1
+            if value is None or conf < 5:
+                continue
+            tokens.append(Token(
+                value,
+                (d['left'][i] + d['width'][i] / 2) / crop_scale,
+                max(0, y0 - 5) + (d['top'][i] + d['height'][i] / 2) / crop_scale,
+                d['width'][i] / crop_scale,
+                d['height'][i] / crop_scale,
+                text, conf,
+            ))
+
+        band_height = max(30, min(45, round(0.05 * (y1 - y0))))
+        band_x0 = max(0, x0 - 20)
+        band_x1 = min(gray.shape[1], x1 + 20)
+        axis_band = gray[y1:min(gray.shape[0], y1 + band_height), band_x0:band_x1]
+        axis_scale = 6
+        axis_big = cv2.resize(
+            axis_band, None, fx=axis_scale, fy=axis_scale, interpolation=cv2.INTER_CUBIC
+        )
+        axis_data = pytesseract.image_to_data(
+            axis_big,
+            config='--psm 6 -c tessedit_char_whitelist=0123456789.-+',
+            output_type=pytesseract.Output.DICT,
+        )
+        axis_tokens = []
+        for i, text in enumerate(axis_data['text']):
+            value = num(text)
+            try:
+                conf = float(axis_data['conf'][i])
+            except ValueError:
+                conf = -1
+            if value is None or conf < 5:
+                continue
+
+            left = band_x0 + axis_data['left'][i] / axis_scale
+            top = y1 + axis_data['top'][i] / axis_scale
+            width = axis_data['width'][i] / axis_scale
+            height = axis_data['height'][i] / axis_scale
+            if '.' not in text:
+                dot_x0 = max(0, round(left - 4))
+                dot_x1 = max(dot_x0 + 1, round(left) + 1)
+                dot_y0 = max(0, round(top + 0.6 * height))
+                dot_y1 = min(gray.shape[0], round(top + height + 2))
+                leading_dot = np.any(gray[dot_y0:dot_y1, dot_x0:dot_x1] >= 180)
+                if leading_dot:
+                    text = ('-' if text.startswith('-') else '') + '.' + text.lstrip('+-')
+                    value = num(text)
+
+            axis_tokens.append(Token(value, left, top + height / 2, width, height, text, conf))
+
+        y_candidates = [
+            t for t in tokens
+            if x0 - 180 <= t.x <= x0 + 30 and y0 - 12 <= t.y <= y1 + 12
+        ]
+        y_labels = []
+        for t in sorted(y_candidates, key=lambda token: token.confidence, reverse=True):
+            if not any(abs(t.x - q.x) < 12 and abs(t.y - q.y) < 8 for q in y_labels):
+                y_labels.append(t)
+
+        crop_scale = 6
+        border = 12
+        for t in y_labels:
+            left = round(t.x - t.w / 2)
+            right = round(t.x + t.w / 2)
+            top = round(t.y - t.h / 2)
+            bottom = round(t.y + t.h / 2)
+            pad_x = max(5, round(1.5 * t.h))
+            pad_y = max(4, round(0.75 * t.h))
+            crop_x0 = max(0, left - pad_x)
+            crop_x1 = min(gray.shape[1], right + pad_x)
+            crop_y0 = max(0, top - pad_y)
+            crop_y1 = min(gray.shape[0], bottom + pad_y)
+            label_crop = cv2.resize(
+                gray[crop_y0:crop_y1, crop_x0:crop_x1],
+                None, fx=crop_scale, fy=crop_scale, interpolation=cv2.INTER_CUBIC,
+            )
+            label_crop = cv2.copyMakeBorder(
+                label_crop, border, border, border, border,
+                cv2.BORDER_CONSTANT, value=255,
+            )
+            _, thresholded = cv2.threshold(
+                label_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )
+            for padded_crop in (thresholded, cv2.bitwise_not(thresholded)):
+                label_data = pytesseract.image_to_data(
+                    padded_crop,
+                    config='--psm 7 -c tessedit_char_whitelist=0123456789.-+',
+                    output_type=pytesseract.Output.DICT,
+                )
+                for i, text in enumerate(label_data['text']):
+                    value = num(text)
+                    try:
+                        conf = float(label_data['conf'][i])
+                    except ValueError:
+                        conf = -1
+                    if value is None or conf < 5:
+                        continue
+
+                    label_x = (
+                        crop_x0 + (label_data['left'][i] + label_data['width'][i] / 2 - border)
+                        / crop_scale
+                    )
+                    label_y = (
+                        crop_y0 + (label_data['top'][i] + label_data['height'][i] / 2 - border)
+                        / crop_scale
+                    )
+                    if abs(label_x - t.x) > pad_x or abs(label_y - t.y) > pad_y:
+                        continue
+                    tokens.append(Token(
+                        value, label_x, label_y,
+                        label_data['width'][i] / crop_scale,
+                        label_data['height'][i] / crop_scale,
+                        text, conf,
+                    ))
+
+        tokens = [
+            t for t in tokens
+            if not any(abs(t.x - axis_t.x) < 15 and abs(t.y - axis_t.y) < 12
+                       for axis_t in axis_tokens)
+        ]
+        tokens.extend(axis_tokens)
+
     keep = []
     for t in sorted(tokens, key=lambda z: z.confidence, reverse=True):
         if not any(
@@ -171,47 +314,167 @@ def ocr_tokens(im):
 # Best outer pair
 # ---------------------------------------------------------------------------
 
-def best_outer_pair(tokens, axis, rect):
+def calibrate_y_ticks(candidates, rect):
+    _, y0, _, y1 = rect
+    fractional_precision = max(
+        (
+            len(t.text.split('.', 1)[1])
+            for t in candidates
+            if '.' in t.text and 0 < abs(t.value) < 1
+        ),
+        default=0,
+    )
+    scales = [1] + [10 ** precision for precision in range(1, fractional_precision + 1)]
+    tolerance_px = max(6.0, 1.25 * float(np.median([t.h for t in candidates])))
+    best = None
+
+    for scale in scales:
+        adjusted = [
+            Token(
+                t.value / scale if scale > 1 and '.' not in t.text and t.value.is_integer()
+                else t.value,
+                t.x, t.y, t.w, t.h, t.text, t.confidence,
+            )
+            for t in candidates
+        ]
+        for a in adjusted:
+            for b in adjusted:
+                pixel_delta = b.y - a.y
+                if pixel_delta <= 12:
+                    continue
+                slope = (b.value - a.value) / pixel_delta
+                if slope >= 0 or not np.isfinite(slope):
+                    continue
+
+                intercept = a.value - slope * a.y
+                residual_px = np.abs(
+                    (np.asarray([t.value for t in adjusted]) -
+                     (slope * np.asarray([t.y for t in adjusted]) + intercept)) / slope
+                )
+                inlier_ids = np.flatnonzero(residual_px <= tolerance_px)
+                if len(inlier_ids) < 2:
+                    continue
+                inliers = [adjusted[i] for i in inlier_ids]
+                coverage = (max(t.y for t in inliers) - min(t.y for t in inliers)) / (y1 - y0)
+                median_error = float(np.median(residual_px[inlier_ids]))
+                confidence = sum(t.confidence for t in inliers)
+                score = (len(inliers), coverage, -median_error, confidence, -scale)
+                if best is None or score > best[0]:
+                    best = (score, inliers, residual_px[inlier_ids])
+
+    if best is None:
+        raise RuntimeError('no consistent y-axis tick labels')
+
+    _, inliers, _ = best
+    pixels = np.asarray([t.y for t in inliers])
+    values = np.asarray([t.value for t in inliers])
+    slope, intercept = np.polyfit(pixels, values, 1)
+    if not np.isfinite(slope) or slope >= 0:
+        raise RuntimeError('invalid y-axis scale')
+
+    residual_px = np.abs((values - (slope * pixels + intercept)) / slope)
+    refined = [t for t, error in zip(inliers, residual_px) if error <= tolerance_px]
+    if len(refined) >= 2 and len(refined) < len(inliers):
+        pixels = np.asarray([t.y for t in refined])
+        values = np.asarray([t.value for t in refined])
+        slope, intercept = np.polyfit(pixels, values, 1)
+        inliers = refined
+
+    upper = min(inliers, key=lambda t: t.y)
+    lower = max(inliers, key=lambda t: t.y)
+    calibration = Calibration(
+        float(slope), float(intercept),
+        min(t.value for t in inliers), max(t.value for t in inliers),
+        upper.y, lower.y,
+    )
+    return calibration, inliers, (upper, lower)
+
+
+def best_outer_pair(tokens, axis, rect, domain='time', im=None):
     x0, y0, x1, y1 = rect
     if axis == 'x':
         cand = [t for t in tokens if x0 - 30 <= t.x <= x1 + 30 and y1 - 25 <= t.y <= y1 + 90]
-        pix  = lambda t: t.x
         sign = 1
+        if domain == 'time':
+            def pix(t):
+                edge_tolerance = max(12, t.w / 2)
+                if abs(t.x - x0) <= edge_tolerance:
+                    return x0
+                if abs(t.x - x1) <= edge_tolerance:
+                    return x1
+                return t.x
+        else:
+            pix = lambda t: t.x
     else:
         cand = [t for t in tokens if x0 - 180 <= t.x <= x0 + 30 and y0 - 12 <= t.y <= y1 + 12]
         pix  = lambda t: t.y
         sign = -1
 
-    if axis == 'x':
-        cand = [t for t in cand if t.y < y1 + 60 and abs(t.value) <= 100]
-        
+    if axis == 'x' and domain == 'time':
+        label_y_max = y1 + max(30, 0.05 * (y1 - y0))
+        cand = [t for t in cand if y1 <= t.y <= label_y_max]
         if len(cand) < 2:
-            expected_vals = [0.10, 0.11, 0.12, 0.13, 0.14, 0.15]
-            cand = []
-            for val in expected_vals:
-                frac = (val - 0.10) / 0.05
-                px = x0 + frac * (x1 - x0)
-                cand.append(Token(val, px, y1 + 15, 20, 10, f"{val:.2f}", 100.0))
-        else:
-            sorted_cand = sorted(cand, key=lambda t: t.x)
-            expected_vals = [0.10, 0.11, 0.12, 0.13, 0.14, 0.15]
-            
-            forced_cand = []
-            for t in sorted_cand:
-                fraction = np.clip((t.x - x0) / (x1 - x0), 0.0, 1.0)
-                target_val = 0.10 + fraction * 0.05
-                closest_val = min(expected_vals, key=lambda ev: abs(ev - target_val))
-                forced_cand.append(Token(closest_val, t.x, t.y, t.w, t.h, f"{closest_val:.2f}", t.confidence))
-            
-            unique_cand = {}
-            for t in forced_cand:
-                if t.value not in unique_cand or t.confidence > unique_cand[t.value].confidence:
-                    unique_cand[t.value] = t
-            cand = sorted(unique_cand.values(), key=lambda t: t.x)
+            raise RuntimeError('OCR found fewer than two usable x-axis labels')
+    elif axis == 'x':
+        cand = [t for t in cand if t.y >= y1]
 
-    if axis == 'y':
+    if axis == 'y' and domain == 'frequency':
+        unique_cand = []
+        for t in sorted(cand, key=lambda token: token.confidence, reverse=True):
+            match = next((
+                i for i, existing in enumerate(unique_cand)
+                if abs(t.x - existing.x) < 8 and abs(t.y - existing.y) < 8
+            ), None)
+            if match is None:
+                unique_cand.append(t)
+            elif '.' in t.text and '.' not in unique_cand[match].text:
+                unique_cand[match] = t
+        cand = unique_cand
+
+        if im is not None:
+            gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+            fixed_cand = []
+            for t in cand:
+                label_x0 = round(t.x - t.w / 2)
+                label_y0 = round(t.y + t.h * 0.1)
+                label_x1 = label_x0 + max(1, round(t.w * 0.25))
+                label_y1 = round(t.y + t.h / 2)
+                leading_dot = np.any(
+                    gray[max(0, label_y0):label_y1, max(0, label_x0):label_x1] >= 180
+                )
+                if t.value >= 2 and t.value.is_integer() and leading_dot:
+                    fixed_cand.append(Token(
+                        t.value / 10, t.x, t.y, t.w, t.h,
+                        f".{int(t.value)}", t.confidence,
+                    ))
+                else:
+                    fixed_cand.append(t)
+            cand = fixed_cand
+
+    if axis == 'y' and domain == 'time':
         if len(cand) < 2:
             raise RuntimeError('OCR found fewer than two usable y-axis labels')
+        if im is not None:
+            gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+            fixed_cand = []
+            for t in cand:
+                left = round(t.x - t.w / 2)
+                top = round(t.y - t.h / 2)
+                dot_x0 = max(0, left - 4)
+                dot_x1 = max(dot_x0 + 1, left + 1)
+                dot_y0 = max(0, round(top + 0.55 * t.h))
+                dot_y1 = min(gray.shape[0], round(top + t.h + 2))
+                leading_dot = np.any(gray[dot_y0 + 1:dot_y1, dot_x0:dot_x1] >= 180)
+                if '.' not in t.text and t.value.is_integer() and t.value != 0 and leading_dot:
+                    text = ('-' if t.text.startswith('-') else '') + '.' + t.text.lstrip('+-')
+                    fixed_cand.append(Token(
+                        t.value / (10 ** len(t.text.lstrip('+-'))),
+                        t.x, t.y, t.w, t.h, text, t.confidence,
+                    ))
+                else:
+                    fixed_cand.append(t)
+            cand = fixed_cand
+
         y_center = (y0 + y1) / 2
         fixed_cand = []
         for t in cand:
@@ -221,6 +484,11 @@ def best_outer_pair(tokens, axis, rect):
             else:
                 fixed_cand.append(t)
         cand = fixed_cand
+    elif axis == 'y' and len(cand) < 2:
+        raise RuntimeError('OCR found fewer than two usable y-axis labels')
+
+    if axis == 'y':
+        return calibrate_y_ticks(cand, rect)
 
     span  = (x1 - x0) if axis == 'x' else (y1 - y0)
     pairs = []
@@ -329,14 +597,18 @@ def extract_trace_points(mask, rect, xc, yc, sigma=0.0):
     top_filled    = fill(top)
     bottom_filled = fill(bottom)
 
-    mid_y_px = (top_filled + bottom_filled) / 2.0
+    top_y = yc.value(top_filled)
+    bottom_y = yc.value(bottom_filled)
+    extreme_px = np.where(
+        np.abs(top_y) >= np.abs(bottom_y), top_filled, bottom_filled
+    )
 
     if sigma > 0:
-        mid_y_px = gaussian_filter1d(mid_y_px, sigma=sigma)
+        extreme_px = gaussian_filter1d(extreme_px, sigma=sigma)
 
     pixel_x = x0 + np.arange(w, dtype=float)
     calibrated_x = xc.value(pixel_x)
-    calibrated_y = yc.value(mid_y_px)
+    calibrated_y = yc.value(extreme_px)
 
     rows = []
     for i in range(w):
@@ -344,7 +616,7 @@ def extract_trace_points(mask, rect, xc, yc, sigma=0.0):
             'X': float(calibrated_x[i]),
             'Y': float(calibrated_y[i]),
             'pixel_x': float(pixel_x[i]),
-            'pixel_y': float(mid_y_px[i]),
+            'pixel_y': float(extreme_px[i]),
         })
 
     return rows
@@ -419,9 +691,9 @@ def process(path, outdir, debug, opts):
         raise RuntimeError('image could not be read')
 
     rect                = plot_rect(im)
-    toks                = ocr_tokens(im)
-    xc, xt, xpair       = best_outer_pair(toks, 'x', rect)
-    yc, yt, ypair       = best_outer_pair(toks, 'y', rect)
+    toks                = ocr_tokens(im, rect)
+    xc, xt, xpair       = best_outer_pair(toks, 'x', rect, opts.domain, im)
+    yc, yt, ypair       = best_outer_pair(toks, 'y', rect, opts.domain, im)
     mask, margin, floor = trace_mask(im, rect)
 
     rows = extract_trace_points(mask, rect, xc, yc, sigma=opts.sigma)
@@ -437,7 +709,10 @@ def process(path, outdir, debug, opts):
         w = csv.DictWriter(f, fieldnames=['X', 'Y'])
         w.writeheader()
         for r in rows:
-            w.writerow({'X': f"{r['X']:.10g}", 'Y': f"{r['Y']:.10g}"})
+            w.writerow({
+                'X': f"{r['X']:.4f}" if round(r['X'], 4) else '0.00',
+                'Y': f"{r['Y']:.3f}" if round(r['Y'], 3) else '0.00',
+            })
 
     if opts.overlay:
         overlay      = draw_overlay(im, rows, rect, xc, yc)
@@ -465,6 +740,7 @@ def process(path, outdir, debug, opts):
         report = dest / (path.stem + '_ocr.txt')
         report.write_text('\n'.join([
             f'Image: {path}',
+            f'X-axis domain: {opts.domain}',
             f'Plot rectangle: {rect}',
             f'X outer labels: {xpair[0].text} -> {xpair[0].value} at {xpair[0].x:.2f}; '
             f'{xpair[1].text} -> {xpair[1].value} at {xpair[1].x:.2f}',
@@ -483,8 +759,8 @@ def process(path, outdir, debug, opts):
             ],
         ]), encoding='utf-8')
 
-        xc, xt_cand, xpair = best_outer_pair(toks, 'x', rect)
-        yc, yt_cand, ypair = best_outer_pair(toks, 'y', rect)
+        xc, xt_cand, xpair = best_outer_pair(toks, 'x', rect, opts.domain, im)
+        yc, yt_cand, ypair = best_outer_pair(toks, 'y', rect, opts.domain, im)
         
         ocr_preview = draw_ocr_preview(im, toks, rect, xt_cand, yt_cand)
         cv2.imwrite(str(dest / (path.stem + '_ocr_preview.png')), ocr_preview)
